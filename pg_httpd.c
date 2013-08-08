@@ -26,7 +26,9 @@
 #include "pgstat.h"
 #include "tcop/utility.h"
 
+#define DEFAULT_PG_HTTPD_MAX_SOCKETS 5
 #define DEFAULT_PG_HTTPD_PORT 8888
+#define DEFAULT_PG_HTTPD_QUEUE_DEPTH 32
 
 PG_MODULE_MAGIC;
 
@@ -38,7 +40,9 @@ static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
+static int pg_httpd_max_sockets = DEFAULT_PG_HTTPD_MAX_SOCKETS;
 static int pg_httpd_port = DEFAULT_PG_HTTPD_PORT;
+static int pg_httpd_queue_depth = DEFAULT_PG_HTTPD_QUEUE_DEPTH;
 
 /*
  * Signal handler for SIGTERM
@@ -73,11 +77,22 @@ pg_httpd_sighup(SIGNAL_ARGS)
 void
 pg_httpd_main(Datum main_arg)
 {
+	int i;
+
 	struct sockaddr_in sa;
 	int val;
 	int socket_listener;
+	int flags;
 
 	StringInfoData reply;
+
+	int highsock;
+	int *connectlist;
+	fd_set socks;
+	struct timeval timeout;
+	int readsocks;
+
+	connectlist = (int *) palloc(sizeof(int) * pg_httpd_max_sockets);
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, pg_httpd_sighup);
@@ -103,6 +118,10 @@ pg_httpd_main(Datum main_arg)
 
 	setsockopt(socket_listener, SOL_SOCKET, SO_REUSEADDR, &val, sizeof (val));
 
+	if ((flags = fcntl(socket_listener, F_GETFL, 0)) == -1)
+		flags = 0;
+	fcntl(socket_listener, F_SETFL, flags | O_NONBLOCK);
+
 	if (bind(socket_listener, (struct sockaddr *) &sa,
 			sizeof(struct sockaddr_in)) < 0)
 	{
@@ -110,11 +129,15 @@ pg_httpd_main(Datum main_arg)
 		proc_exit(1);
 	}
 
-	if (listen(socket_listener, 1) < 0)
+	if (listen(socket_listener, pg_httpd_queue_depth) < 0)
 	{
 		elog(ERROR, "listen() error");
 		proc_exit(1);
 	}
+
+	highsock = socket_listener;
+	for (i = 0; i < pg_httpd_max_sockets; i++)
+		connectlist[i] = 0;
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
@@ -159,25 +182,79 @@ pg_httpd_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		sockfd = accept(socket_listener, (struct sockaddr *) &sa, &addrlen);
-		if (sockfd == -1)
+		FD_ZERO(&socks);
+		FD_SET(socket_listener, &socks);
+
+		for (i = 0; i < pg_httpd_max_sockets; i++)
 		{
-			elog(WARNING, "accept() error");
+			if (connectlist[i] != 0)
+			{
+				FD_SET(connectlist[i], &socks);
+				if (connectlist[i] > highsock)
+					highsock = connectlist[i];
+			}
+		}
+
+		timeout.tv_sec = 1;
+		timeout.tv_usec = 0;
+		readsocks = select(highsock + 1, &socks, (fd_set *) 0, (fd_set *) 0,
+				&timeout);
+
+		if (readsocks < 0)
+		{
+			elog(ERROR, "select");
 			continue;
 		}
 
-		memset(data, 0, sizeof(data));
-		received = recv(sockfd, data, length, 0);
+		if (readsocks == 0)
+			continue;
+		else
+		{
+			if (FD_ISSET(socket_listener, &socks))
+			{
+				sockfd = accept(socket_listener, (struct sockaddr *) &sa,
+						&addrlen);
+				if (sockfd == -1)
+				{
+					if (errno != EAGAIN)
+						elog(WARNING, "accept() error: %d %d", errno);
+					continue;
+				}
 
-		content_length = 12;
-		appendStringInfo(&reply,
-				"HTTP/1.0 200 OK\r\n" \
-				"Content-Length: %d\r\n\r\n" \
-				"Hello world!",
-				content_length);
-		send(sockfd, reply.data, strlen(reply.data), 0);
-		close(sockfd);
-		resetStringInfo(&reply);
+				for (i = 0; (i < pg_httpd_max_sockets) && (sockfd != -1); i++)
+					if (connectlist[i] == 0)
+					{
+						connectlist[i] = sockfd;
+						sockfd = -1;
+					}
+
+				if (sockfd != -1)
+				{
+					elog(WARNING, "server too busy");
+					close(sockfd);
+					continue;
+				}
+			}
+
+			for (i = 0; i < pg_httpd_max_sockets; i++)
+			{
+				if (FD_ISSET(connectlist[i], &socks))
+				{
+					memset(data, 0, sizeof(data));
+					received = recv(connectlist[i], data, length, 0);
+
+					content_length = 12;
+					appendStringInfo(&reply,
+							"HTTP/1.0 200 OK\r\n"
+							"Content-Length: %d\r\n\r\n"
+							"Hello world!",
+							content_length);
+					send(connectlist[i], reply.data, strlen(reply.data), 0);
+					close(connectlist[i]);
+					connectlist[i] = 0;
+				}
+			}
+		}
 	}
 
 	proc_exit(1);
@@ -198,6 +275,19 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
+	DefineCustomIntVariable("pg_httpd.max_sockets",
+			"HTTPD maximum number of connected clients.",
+			NULL,
+			&pg_httpd_max_sockets,
+			DEFAULT_PG_HTTPD_MAX_SOCKETS,
+			1,
+			65535,
+			PGC_POSTMASTER,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
 	DefineCustomIntVariable("pg_httpd.port",
 			"HTTPD listener port.",
 			NULL,
@@ -211,11 +301,24 @@ _PG_init(void)
 			NULL,
 			NULL);
 
+	DefineCustomIntVariable("pg_httpd.queue_depth",
+			"HTTPD maximum queue length.",
+			NULL,
+			&pg_httpd_queue_depth,
+			DEFAULT_PG_HTTPD_QUEUE_DEPTH,
+			1,
+			128,
+			PGC_POSTMASTER,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
 	/* set up common data for all our workers */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_restart_time = 1;
 	worker.bgw_main = pg_httpd_main;
 	worker.bgw_sighup = pg_httpd_sighup;
 	worker.bgw_sigterm = pg_httpd_sigterm;
